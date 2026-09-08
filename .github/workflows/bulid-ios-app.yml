@@ -21,6 +21,11 @@ on:
         required: false
         default: false
         type: boolean
+      maplibre_version:
+        description: 'MapLibre Compose version (use 0.15.1-SNAPSHOT to follow the mutable snapshot)'
+        required: false
+        default: '0.15.1-20260907.101928-13'
+        type: string
   push:
     branches:
       - 'codex/kmp-compose-migration'
@@ -34,6 +39,7 @@ concurrency:
 
 env:
   CONFIGURATION: ${{ inputs.configuration || 'Debug' }}
+  MAPLIBRE_COMPOSE_VERSION: ${{ inputs.maplibre_version || '0.15.1-20260907.101928-13' }}
   XCODE_PROJECT: iosApp/iosApp.xcodeproj
   DERIVED_DATA_SIM: build/xcode-ci-simulator
   DERIVED_DATA_DEVICE: build/xcode-ci-device
@@ -58,6 +64,39 @@ jobs:
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
+
+      # The branch follows the *mutable* org.maplibre.compose 0.15.1-SNAPSHOT, whose API changes
+      # daily, so an unpinned CI build breaks whenever upstream publishes. Pin the timestamped
+      # publication the sources are written against (see docs/multiplatform/03-maplibre-compose-upstream.md).
+      # This goes in GRADLE_USER_HOME rather than on the command line because the Xcode build phase
+      # invokes a bare `./gradlew`, which would otherwise resolve a different snapshot.
+      - name: Pin MapLibre Compose snapshot
+        run: |
+          set -euo pipefail
+          gradle_home="${GRADLE_USER_HOME:-$HOME/.gradle}"
+          mkdir -p "$gradle_home/init.d"
+          if [ -z "$MAPLIBRE_COMPOSE_VERSION" ] || [ "${MAPLIBRE_COMPOSE_VERSION%-SNAPSHOT}" != "$MAPLIBRE_COMPOSE_VERSION" ]; then
+            echo "Following the mutable snapshot; upstream may have moved past what this branch compiles against."
+            exit 0
+          fi
+          echo "mapLibreComposeVersion=$MAPLIBRE_COMPOSE_VERSION" >> "$gradle_home/gradle.properties"
+          # Pinning the declared version is not enough: maplibre-compose's Gradle module metadata
+          # redirects its platform variants (…-iossimulatorarm64 etc.) to a plain 0.15.1-SNAPSHOT,
+          # which would resolve to the newest daily build again. Force the whole group instead.
+          cat > "$gradle_home/init.d/pin-maplibre-compose.gradle" <<GROOVY
+          def pinned = "$MAPLIBRE_COMPOSE_VERSION"
+          allprojects {
+              configurations.configureEach {
+                  resolutionStrategy.eachDependency { details ->
+                      if (details.requested.group == "org.maplibre.compose"
+                          && details.requested.version?.endsWith("-SNAPSHOT")) {
+                          details.useVersion(pinned)
+                      }
+                  }
+              }
+          }
+          GROOVY
+          echo "Pinned org.maplibre.compose to $MAPLIBRE_COMPOSE_VERSION"
 
       # ~/.konan holds the Kotlin/Native toolchain and prebuilt platform libs (~2 GB)
       - name: Cache Kotlin/Native toolchain
