@@ -21,8 +21,13 @@ on:
         required: false
         default: false
         type: boolean
+      maplibre_commit:
+        description: "maplibre-compose commit to build and publish locally, or 'none' to use a published artifact"
+        required: false
+        default: '7fddf793185833a70f89bc5d3c38babbe65490e5'
+        type: string
       maplibre_version:
-        description: 'MapLibre Compose version (use 0.15.1-SNAPSHOT to follow the mutable snapshot)'
+        description: "Published MapLibre Compose version, used only when maplibre_commit is 'none'"
         required: false
         default: '0.15.1-20260907.101928-13'
         type: string
@@ -39,7 +44,10 @@ concurrency:
 
 env:
   CONFIGURATION: ${{ inputs.configuration || 'Debug' }}
+  DEVICE_BUILD: ${{ inputs.device_build || false }}
+  MAPLIBRE_COMMIT: ${{ inputs.maplibre_commit || '7fddf793185833a70f89bc5d3c38babbe65490e5' }}
   MAPLIBRE_COMPOSE_VERSION: ${{ inputs.maplibre_version || '0.15.1-20260907.101928-13' }}
+  MAPLIBRE_SRC_DIR: maplibre-compose-src
   XCODE_PROJECT: iosApp/iosApp.xcodeproj
   DERIVED_DATA_SIM: build/xcode-ci-simulator
   DERIVED_DATA_DEVICE: build/xcode-ci-device
@@ -65,28 +73,84 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      # The branch follows the *mutable* org.maplibre.compose 0.15.1-SNAPSHOT, whose API changes
-      # daily, so an unpinned CI build breaks whenever upstream publishes. Pin the timestamped
-      # publication the sources are written against (see docs/multiplatform/03-maplibre-compose-upstream.md).
-      # This goes in GRADLE_USER_HOME rather than on the command line because the Xcode build phase
-      # invokes a bare `./gradlew`, which would otherwise resolve a different snapshot.
-      - name: Pin MapLibre Compose snapshot
+      # ~/.konan holds the Kotlin/Native toolchain and prebuilt platform libs (~2 GB)
+      - name: Cache Kotlin/Native toolchain
+        uses: actions/cache@v4
+        with:
+          path: ~/.konan
+          key: konan-${{ runner.os }}-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', 'build.gradle.kts', 'app/build.gradle.kts', 'gradle/libs.versions.toml') }}
+          restore-keys: konan-${{ runner.os }}-
+
+      # This branch tracks the *mutable* org.maplibre.compose 0.15.1-SNAPSHOT, and its sources only
+      # compile against upstream commits b1652c3..6fded72 (2026-09-07): rememberVectorTileSource
+      # landed in b1652c3 and initialBaseStyle was removed in 0d51043 under three hours later.
+      # Upstream's daily publisher stepped over that window, so *no* published snapshot compiles this
+      # branch and the artifacts have to be built from a commit inside it. 7fddf79 is the one the
+      # branch was validated against — docs/multiplatform/03-maplibre-compose-upstream.md calls it
+      # 9cd93ad, its pre-merge SHA. Set maplibre_commit to 'none' to try a published snapshot again,
+      # which is what you want once this branch is rebased onto current upstream.
+      - name: Check out MapLibre Compose
+        if: env.MAPLIBRE_COMMIT != 'none'
+        uses: actions/checkout@v4
+        with:
+          repository: maplibre/maplibre-compose
+          ref: ${{ env.MAPLIBRE_COMMIT }}
+          path: ${{ env.MAPLIBRE_SRC_DIR }}
+
+      # Only the two modules and the Apple targets StreetComplete resolves, which skips their
+      # Android, JVM, JS and desktop-runtime publications. Their gradle.properties turns
+      # signAllPublications on, which would demand a GPG key we do not have.
+      - name: Publish MapLibre Compose to the local Maven repository
+        if: env.MAPLIBRE_COMMIT != 'none'
+        working-directory: ${{ env.MAPLIBRE_SRC_DIR }}
         run: |
           set -euo pipefail
+          version="0.15.1-ci-$(git rev-parse --short HEAD)"
+          tasks=""
+          for module in :lib:maplibre-compose :lib:location; do
+            tasks="$tasks $module:publishKotlinMultiplatformPublicationToMavenLocal"
+            tasks="$tasks $module:publishIosSimulatorArm64PublicationToMavenLocal"
+            if [ "$DEVICE_BUILD" = "true" ]; then
+              tasks="$tasks $module:publishIosArm64PublicationToMavenLocal"
+            fi
+          done
+          # shellcheck disable=SC2086
+          ./gradlew -PmaplibreVersion="$version" -PsignAllPublications=false $tasks
+          echo "RESOLVED_MAPLIBRE_VERSION=$version" >> "$GITHUB_ENV"
+
+      # Written to GRADLE_USER_HOME rather than passed on the command line because the Xcode build
+      # phase invokes a bare `./gradlew`, which would otherwise resolve something else entirely.
+      - name: Point StreetComplete at the pinned MapLibre Compose
+        run: |
+          set -euo pipefail
+          version="${RESOLVED_MAPLIBRE_VERSION:-$MAPLIBRE_COMPOSE_VERSION}"
           gradle_home="${GRADLE_USER_HOME:-$HOME/.gradle}"
           mkdir -p "$gradle_home/init.d"
-          if [ -z "$MAPLIBRE_COMPOSE_VERSION" ] || [ "${MAPLIBRE_COMPOSE_VERSION%-SNAPSHOT}" != "$MAPLIBRE_COMPOSE_VERSION" ]; then
-            echo "Following the mutable snapshot; upstream may have moved past what this branch compiles against."
+          if [ -z "$version" ] || [ "${version%-SNAPSHOT}" != "$version" ]; then
+            echo "Following the mutable snapshot; upstream has moved past what this branch compiles against."
             exit 0
           fi
-          echo "mapLibreComposeVersion=$MAPLIBRE_COMPOSE_VERSION" >> "$gradle_home/gradle.properties"
-          # Pinning the declared version is not enough: maplibre-compose's Gradle module metadata
-          # redirects its platform variants (…-iossimulatorarm64 etc.) to a plain 0.15.1-SNAPSHOT,
-          # which would resolve to the newest daily build again. Force the whole group instead.
+          echo "mapLibreComposeVersion=$version" >> "$gradle_home/gradle.properties"
+          # Setting the version alone is not enough: maplibre-compose's module metadata redirects its
+          # platform variants (…-iossimulatorarm64 and friends) to a plain 0.15.1-SNAPSHOT, which
+          # would resolve back to the newest daily build. So force the whole group, and add
+          # mavenLocal for the locally published build. mavenLocal goes to a project only where that
+          # project already declares repositories, so PREFER_PROJECT resolution stays intact for the
+          # projects that rely on the settings-level repositories.
           cat > "$gradle_home/init.d/pin-maplibre-compose.gradle" <<GROOVY
-          def pinned = "$MAPLIBRE_COMPOSE_VERSION"
-          allprojects {
-              configurations.configureEach {
+          def pinned = "$version"
+          beforeSettings { settings ->
+              settings.dependencyResolutionManagement.repositories {
+                  mavenLocal { content { includeGroup("org.maplibre.compose") } }
+              }
+          }
+          allprojects { project ->
+              project.afterEvaluate {
+                  if (!project.repositories.isEmpty()) {
+                      project.repositories.mavenLocal { content { includeGroup("org.maplibre.compose") } }
+                  }
+              }
+              project.configurations.configureEach {
                   resolutionStrategy.eachDependency { details ->
                       if (details.requested.group == "org.maplibre.compose"
                           && details.requested.version?.endsWith("-SNAPSHOT")) {
@@ -96,15 +160,7 @@ jobs:
               }
           }
           GROOVY
-          echo "Pinned org.maplibre.compose to $MAPLIBRE_COMPOSE_VERSION"
-
-      # ~/.konan holds the Kotlin/Native toolchain and prebuilt platform libs (~2 GB)
-      - name: Cache Kotlin/Native toolchain
-        uses: actions/cache@v4
-        with:
-          path: ~/.konan
-          key: konan-${{ runner.os }}-${{ hashFiles('gradle/wrapper/gradle-wrapper.properties', 'build.gradle.kts', 'app/build.gradle.kts', 'gradle/libs.versions.toml') }}
-          restore-keys: konan-${{ runner.os }}-
+          echo "Pinned org.maplibre.compose to $version"
 
       - name: Show toolchain versions
         run: |
