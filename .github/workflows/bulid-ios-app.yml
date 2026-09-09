@@ -1,4 +1,4 @@
-name: Build iOS app
+name: Build iOS ipa
 
 on:
   workflow_dispatch:
@@ -16,11 +16,6 @@ on:
         options:
           - Debug
           - Release
-      device_build:
-        description: 'Also build an unsigned device (arm64) .app'
-        required: false
-        default: false
-        type: boolean
       maplibre_commit:
         description: "maplibre-compose commit to build and publish locally, or 'none' to use a published artifact"
         required: false
@@ -44,17 +39,14 @@ concurrency:
 
 env:
   CONFIGURATION: ${{ inputs.configuration || 'Debug' }}
-  DEVICE_BUILD: ${{ inputs.device_build || false }}
   MAPLIBRE_COMMIT: ${{ inputs.maplibre_commit || '7fddf793185833a70f89bc5d3c38babbe65490e5' }}
   MAPLIBRE_COMPOSE_VERSION: ${{ inputs.maplibre_version || '0.15.1-20260907.101928-13' }}
   MAPLIBRE_SRC_DIR: maplibre-compose-src
   XCODE_PROJECT: iosApp/iosApp.xcodeproj
-  DERIVED_DATA_SIM: build/xcode-ci-simulator
-  DERIVED_DATA_DEVICE: build/xcode-ci-device
+  DERIVED_DATA: build/xcode-ci
 
 jobs:
   build:
-    # Kotlin/Native only targets iosArm64 + iosSimulatorArm64 here, so an Apple Silicon runner is required
     runs-on: macos-15
     timeout-minutes: 120
 
@@ -97,8 +89,8 @@ jobs:
           ref: ${{ env.MAPLIBRE_COMMIT }}
           path: ${{ env.MAPLIBRE_SRC_DIR }}
 
-      # Only the two modules and the Apple targets StreetComplete resolves, which skips their
-      # Android, JVM, JS and desktop-runtime publications. Their gradle.properties turns
+      # Only the two modules and the one Apple target StreetComplete resolves, which skips their
+      # simulator, Android, JVM, JS and desktop-runtime publications. Their gradle.properties turns
       # signAllPublications on, which would demand a GPG key we do not have.
       - name: Publish MapLibre Compose to the local Maven repository
         if: env.MAPLIBRE_COMMIT != 'none'
@@ -109,10 +101,7 @@ jobs:
           tasks=""
           for module in :lib:maplibre-compose :lib:location; do
             tasks="$tasks $module:publishKotlinMultiplatformPublicationToMavenLocal"
-            tasks="$tasks $module:publishIosSimulatorArm64PublicationToMavenLocal"
-            if [ "$DEVICE_BUILD" = "true" ]; then
-              tasks="$tasks $module:publishIosArm64PublicationToMavenLocal"
-            fi
+            tasks="$tasks $module:publishIosArm64PublicationToMavenLocal"
           done
           # shellcheck disable=SC2086
           ./gradlew -PmaplibreVersion="$version" -PsignAllPublications=false $tasks
@@ -132,11 +121,11 @@ jobs:
           fi
           echo "mapLibreComposeVersion=$version" >> "$gradle_home/gradle.properties"
           # Setting the version alone is not enough: maplibre-compose's module metadata redirects its
-          # platform variants (…-iossimulatorarm64 and friends) to a plain 0.15.1-SNAPSHOT, which
-          # would resolve back to the newest daily build. So force the whole group, and add
-          # mavenLocal for the locally published build. mavenLocal goes to a project only where that
-          # project already declares repositories, so PREFER_PROJECT resolution stays intact for the
-          # projects that rely on the settings-level repositories.
+          # platform variants (…-iosarm64 and friends) to a plain 0.15.1-SNAPSHOT, which would
+          # resolve back to the newest daily build. So force the whole group, and add mavenLocal for
+          # the locally published build. mavenLocal goes to a project only where that project already
+          # declares repositories, so PREFER_PROJECT resolution stays intact for the projects that
+          # rely on the settings-level repositories.
           cat > "$gradle_home/init.d/pin-maplibre-compose.gradle" <<GROOVY
           def pinned = "$version"
           beforeSettings { settings ->
@@ -241,49 +230,20 @@ jobs:
 
       # Not strictly needed (the Xcode build phase runs embedAndSignAppleFrameworkForXcode, which
       # depends on this task) but it separates "Kotlin did not compile" from "Xcode failed" in the log
-      - name: Compile Kotlin framework for the simulator
-        run: ./gradlew ":app:link${CONFIGURATION}FrameworkIosSimulatorArm64"
+      - name: Compile Kotlin framework for the device
+        run: ./gradlew ":app:link${CONFIGURATION}FrameworkIosArm64"
 
-      - name: Build app for iOS Simulator
-        run: |
-          xcodebuild \
-            -project "$XCODE_PROJECT" \
-            -scheme iosApp \
-            -configuration "$CONFIGURATION" \
-            -destination 'generic/platform=iOS Simulator' \
-            -derivedDataPath "$DERIVED_DATA_SIM" \
-            ARCHS=arm64 \
-            ONLY_ACTIVE_ARCH=NO \
-            CODE_SIGNING_ALLOWED=NO \
-            COMPILER_INDEX_STORE_ENABLE=NO \
-            build
-
-      - name: Package simulator app
-        run: |
-          set -euo pipefail
-          products="$DERIVED_DATA_SIM/Build/Products/$CONFIGURATION-iphonesimulator"
-          ditto -c -k --sequesterRsrc --keepParent \
-            "$products/StreetComplete.app" \
-            "StreetComplete-ios-simulator-$CONFIGURATION-$COMMIT_SHA.zip"
-
-      - name: Archive simulator app
-        uses: actions/upload-artifact@v4
-        with:
-          name: StreetComplete-ios-simulator-${{ env.CONFIGURATION }}-${{ env.COMMIT_SHA }}
-          path: StreetComplete-ios-simulator-*.zip
-          retention-days: 30
-
-      # Signing certificates are not available in CI, so the device build is left unsigned:
-      # it verifies the iosArm64 target compiles and links, but cannot be installed as-is.
+      # Built unsigned on purpose. Sideloading tools (Sideloadly, AltStore) re-sign with your own
+      # Apple ID and rewrite the bundle ID, so a signature from CI would only be thrown away — and
+      # CI has no signing certificate for the TEAM_ID in iosApp/Configuration/Config.xcconfig anyway.
       - name: Build unsigned app for iOS device
-        if: ${{ inputs.device_build }}
         run: |
           xcodebuild \
             -project "$XCODE_PROJECT" \
             -scheme iosApp \
             -configuration "$CONFIGURATION" \
             -destination 'generic/platform=iOS' \
-            -derivedDataPath "$DERIVED_DATA_DEVICE" \
+            -derivedDataPath "$DERIVED_DATA" \
             ARCHS=arm64 \
             ONLY_ACTIVE_ARCH=NO \
             CODE_SIGNING_ALLOWED=NO \
@@ -293,19 +253,22 @@ jobs:
             COMPILER_INDEX_STORE_ENABLE=NO \
             build
 
-      - name: Package unsigned device app
-        if: ${{ inputs.device_build }}
+      # An ipa is just a zip with the .app inside a top-level Payload/ directory.
+      - name: Package ipa
         run: |
           set -euo pipefail
-          products="$DERIVED_DATA_DEVICE/Build/Products/$CONFIGURATION-iphoneos"
-          ditto -c -k --sequesterRsrc --keepParent \
-            "$products/StreetComplete.app" \
-            "StreetComplete-ios-device-unsigned-$CONFIGURATION-$COMMIT_SHA.zip"
+          products="$DERIVED_DATA/Build/Products/$CONFIGURATION-iphoneos"
+          staging="$RUNNER_TEMP/ipa"
+          rm -rf "$staging"
+          mkdir -p "$staging/Payload"
+          cp -R "$products/StreetComplete.app" "$staging/Payload/"
+          ditto -c -k --keepParent "$staging/Payload" \
+            "StreetComplete-$CONFIGURATION-$COMMIT_SHA.ipa"
+          unzip -l "StreetComplete-$CONFIGURATION-$COMMIT_SHA.ipa" | head -5
 
-      - name: Archive unsigned device app
-        if: ${{ inputs.device_build }}
+      - name: Archive ipa
         uses: actions/upload-artifact@v4
         with:
-          name: StreetComplete-ios-device-unsigned-${{ env.CONFIGURATION }}-${{ env.COMMIT_SHA }}
-          path: StreetComplete-ios-device-unsigned-*.zip
+          name: StreetComplete-ipa-${{ env.CONFIGURATION }}-${{ env.COMMIT_SHA }}
+          path: '*.ipa'
           retention-days: 30
